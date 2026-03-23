@@ -39,6 +39,12 @@ jobs:
           git remote add upstream https://github.com/openclaw/openclaw.git || true
           git fetch upstream main
           git rebase upstream/main
+
+          # Remove upstream workflow files the fork doesn't need
+          find .github/workflows -name '*.yml' ! -name 'build-openshift-image.yml' -delete 2>/dev/null || true
+          git add -A .github/workflows/
+          git diff --cached --quiet || git commit -m "ci: remove upstream workflow files from fork"
+
           git push origin upstream --force
 
   # PR validation: amd64 only, no push
