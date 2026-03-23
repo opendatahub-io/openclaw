@@ -1,0 +1,198 @@
+# syntax=docker/dockerfile:1.7
+
+# OpenClaw Gateway - UBI 9 multi-stage build for OpenShift
+#
+# Build examples:
+#   podman build -t openclaw-ubi:latest -f Dockerfile.openshift .
+#   podman build --build-arg OPENCLAW_EXTENSIONS="diagnostics-otel" -f Dockerfile.openshift .
+
+ARG OPENCLAW_EXTENSIONS="diagnostics-otel"
+ARG OPENCLAW_UBI_NODE_IMAGE="registry.access.redhat.com/ubi9/nodejs-22"
+ARG OPENCLAW_UBI_NODE_MINIMAL_IMAGE="registry.access.redhat.com/ubi9/nodejs-22-minimal"
+
+# ── Stage 1: Extract extension package.json files ─────────────
+FROM ${OPENCLAW_UBI_NODE_IMAGE} AS ext-deps
+ARG OPENCLAW_EXTENSIONS
+WORKDIR /opt/app-root/src
+
+COPY extensions /tmp/extensions
+
+RUN mkdir -p /opt/app-root/src/ext-out && \
+    for ext in $OPENCLAW_EXTENSIONS; do \
+      if [ -f "/tmp/extensions/$ext/package.json" ]; then \
+        mkdir -p "/opt/app-root/src/ext-out/$ext" && \
+        cp "/tmp/extensions/$ext/package.json" "/opt/app-root/src/ext-out/$ext/package.json"; \
+      fi; \
+    done
+
+# ── Stage 2: Build ────────────────────────────────────────────
+FROM ${OPENCLAW_UBI_NODE_IMAGE} AS build
+ARG OPENCLAW_EXTENSIONS
+
+WORKDIR /opt/app-root/src
+
+USER 0
+RUN dnf install -y --disablerepo='*' --enablerepo='ubi-*' \
+      cmake \
+      git && \
+    dnf clean all
+
+ENV BUN_INSTALL=/opt/app-root/.bun
+ENV COREPACK_HOME=/opt/app-root/.local/share/corepack
+ENV NPM_CONFIG_CACHE=/opt/app-root/src/.npm
+ENV PATH=/opt/app-root/.bun/bin:${PATH}
+
+RUN mkdir -p "$BUN_INSTALL" "$COREPACK_HOME" "$NPM_CONFIG_CACHE" && \
+    chown -R 1001:0 /opt/app-root
+
+USER 1001
+
+# Install Bun (required by upstream build scripts).
+RUN set -eux; \
+    for attempt in 1 2 3 4 5; do \
+      if curl --retry 5 --retry-all-errors --retry-delay 2 -fsSL https://bun.sh/install | bash; then \
+        break; \
+      fi; \
+      if [ "$attempt" -eq 5 ]; then \
+        exit 1; \
+      fi; \
+      sleep $((attempt * 2)); \
+    done
+
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
+COPY ui/package.json ./ui/package.json
+COPY patches ./patches
+COPY --from=ext-deps /opt/app-root/src/ext-out/ ./extensions/
+
+USER 0
+RUN chown -R 1001:0 /opt/app-root/src
+RUN if command -v corepack >/dev/null 2>&1; then \
+      corepack enable && \
+      corepack prepare "$(node -p "require('./package.json').packageManager")" --activate; \
+    else \
+      PNPM_VERSION="$(node -p "require('./package.json').packageManager?.split('@')[1] || '10'")" && \
+      npm install -g "pnpm@${PNPM_VERSION}"; \
+    fi
+
+USER 1001
+RUN --mount=type=cache,id=openclaw-pnpm-store,target=/opt/app-root/.local/share/pnpm/store,sharing=locked \
+    NODE_OPTIONS=--max-old-space-size=2048 pnpm install --frozen-lockfile
+
+COPY . .
+
+USER 0
+RUN chown -R 1001:0 /opt/app-root/src
+
+# Normalize extension paths so copied runtime assets keep safe modes.
+RUN for dir in /opt/app-root/src/extensions /opt/app-root/src/.agent /opt/app-root/src/.agents; do \
+      if [ -d "$dir" ]; then \
+        find "$dir" -type d -exec chmod 755 {} +; \
+        find "$dir" -type f -exec chmod 644 {} +; \
+      fi; \
+    done
+
+USER 1001
+# A2UI bundle may fail under cross-compilation; stub it so builds still succeed.
+RUN pnpm canvas:a2ui:bundle || \
+    (echo "A2UI bundle: creating stub (non-fatal)" && \
+     mkdir -p src/canvas-host/a2ui && \
+     echo "/* A2UI bundle unavailable in this build */" > src/canvas-host/a2ui/a2ui.bundle.js && \
+     echo "stub" > src/canvas-host/a2ui/.bundle.hash && \
+     rm -rf vendor/a2ui apps/shared/OpenClawKit/Tools/CanvasA2UI)
+
+RUN pnpm build:docker
+
+ENV OPENCLAW_PREFER_PNPM=1
+RUN pnpm ui:build
+
+# ── Stage 3: Prune dev dependencies ──────────────────────────
+FROM build AS runtime-assets
+
+RUN CI=true pnpm prune --prod && \
+    find dist -type f \( -name '*.d.ts' -o -name '*.d.mts' -o -name '*.d.cts' -o -name '*.map' \) -delete
+
+# ── Stage 4: Runtime (UBI 9 minimal) ─────────────────────────
+FROM ${OPENCLAW_UBI_NODE_MINIMAL_IMAGE}
+
+LABEL org.opencontainers.image.source="https://github.com/openclaw/openclaw" \
+      org.opencontainers.image.url="https://openclaw.ai" \
+      org.opencontainers.image.documentation="https://docs.openclaw.ai/install/docker" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.title="OpenClaw (UBI 9)" \
+      org.opencontainers.image.description="OpenClaw gateway and CLI runtime image on UBI 9"
+
+WORKDIR /app
+
+USER 0
+RUN microdnf update -y && \
+    microdnf install -y \
+      procps-ng \
+      hostname \
+      git \
+      findutils \
+      openssl \
+      openssh-clients \
+      shadow-utils && \
+    microdnf clean all && \
+    if ! getent passwd node >/dev/null; then \
+      useradd -u 1000 -g 0 -d /home/node -m node; \
+    fi && \
+    chown node:0 /app
+
+COPY --from=runtime-assets --chown=node:0 /opt/app-root/src/dist ./dist
+COPY --from=runtime-assets --chown=node:0 /opt/app-root/src/node_modules ./node_modules
+COPY --from=runtime-assets --chown=node:0 /opt/app-root/src/package.json .
+COPY --from=runtime-assets --chown=node:0 /opt/app-root/src/openclaw.mjs .
+COPY --from=runtime-assets --chown=node:0 /opt/app-root/src/extensions ./extensions
+COPY --from=runtime-assets --chown=node:0 /opt/app-root/src/skills ./skills
+COPY --from=runtime-assets --chown=node:0 /opt/app-root/src/docs ./docs
+
+ENV OPENCLAW_BUNDLED_PLUGINS_DIR=/app/dist/extensions
+ENV COREPACK_HOME=/usr/local/share/corepack
+
+RUN install -d -m 0755 "$COREPACK_HOME" && \
+    if command -v corepack >/dev/null 2>&1; then \
+      corepack enable && \
+      for attempt in 1 2 3 4 5; do \
+        if corepack prepare "$(node -p "require('./package.json').packageManager")" --activate; then \
+          break; \
+        fi; \
+        if [ "$attempt" -eq 5 ]; then \
+          exit 1; \
+        fi; \
+        sleep $((attempt * 2)); \
+      done && \
+      chmod -R a+rX "$COREPACK_HOME"; \
+    else \
+      PNPM_VERSION="$(node -p "require('./package.json').packageManager?.split('@')[1] || '10'")" && \
+      npm install -g "pnpm@${PNPM_VERSION}"; \
+    fi
+
+# Optional extra runtime packages (must match UBI/RHEL repositories).
+ARG OPENCLAW_DOCKER_EXTRA_PACKAGES=""
+RUN if [ -n "$OPENCLAW_DOCKER_EXTRA_PACKAGES" ]; then \
+      microdnf install -y $OPENCLAW_DOCKER_EXTRA_PACKAGES && \
+      microdnf clean all; \
+    fi
+
+RUN find /app/extensions -type d -exec chmod 755 {} + 2>/dev/null && \
+    find /app/extensions -type f -exec chmod 644 {} + 2>/dev/null || true
+
+RUN ln -sf /app/openclaw.mjs /usr/local/bin/openclaw && \
+    chmod 755 /app/openclaw.mjs
+
+RUN mkdir -p /home/node/.openclaw && \
+    chown -R node:0 /home/node && \
+    chmod -R g=u /home/node
+
+ENV NODE_ENV=production
+ENV HOME=/home/node
+
+USER node
+
+EXPOSE 18789
+
+HEALTHCHECK --interval=3m --timeout=10s --start-period=15s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:18789/healthz').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+
+CMD ["node", "openclaw.mjs", "gateway", "--allow-unconfigured"]
