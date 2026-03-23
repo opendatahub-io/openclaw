@@ -4,7 +4,7 @@ on:
   schedule:
     - cron: '0 3 * * *' # Nightly at 03:00 UTC
   push:
-    branches: [main]
+    branches: [upstream]
     paths:
       - 'Dockerfile.openshift'
       - '.github/workflows/build-openshift-image.yml'
@@ -18,7 +18,7 @@ env:
   IMAGE: quay.io/opendatahub/odh-openclaw-rhel9
 
 jobs:
-  # Sync fork with upstream openclaw/openclaw (skipped on PRs)
+  # Sync upstream branch with openclaw/openclaw:main (skipped on PRs)
   sync:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
@@ -28,6 +28,7 @@ jobs:
       - name: Checkout fork
         uses: actions/checkout@v6
         with:
+          ref: upstream
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -37,8 +38,8 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/openclaw/openclaw.git || true
           git fetch upstream main
-          git merge upstream/main --ff-only || git merge upstream/main --no-edit
-          git push origin main
+          git reset --hard upstream/main
+          git push origin upstream --force
 
   # PR validation: amd64 only, no push
   validate:
@@ -84,7 +85,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          ref: main
+          ref: upstream
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
