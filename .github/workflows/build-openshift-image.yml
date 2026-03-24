@@ -18,21 +18,6 @@ env:
   IMAGE: quay.io/opendatahub/odh-openclaw-rhel9
 
 jobs:
-  # Sync upstream branch to match openclaw/openclaw:main (skipped on PRs)
-  sync:
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Sync upstream branch
-        run: |
-          UPSTREAM_SHA=$(gh api repos/openclaw/openclaw/git/ref/heads/main --jq '.object.sha')
-          gh api repos/${{ github.repository }}/git/refs/heads/upstream \
-            -X PATCH -f sha="$UPSTREAM_SHA" -F force=true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
   # PR validation: amd64 only, no push
   validate:
     if: github.event_name == 'pull_request'
@@ -59,7 +44,6 @@ jobs:
   # Production build: native runners per platform (no QEMU)
   build:
     if: github.event_name != 'pull_request'
-    needs: sync
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -77,12 +61,12 @@ jobs:
       - name: Checkout upstream source
         uses: actions/checkout@v6
         with:
-          ref: upstream
+          repository: openclaw/openclaw
+          ref: main
 
       - name: Overlay fork Dockerfile
         uses: actions/checkout@v6
         with:
-          ref: main
           path: fork-overlay
           sparse-checkout: Dockerfile.openshift
 
